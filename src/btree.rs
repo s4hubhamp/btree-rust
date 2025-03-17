@@ -14,7 +14,7 @@ pub struct BPlusTree<K, V> {
 
 // to reduce confusion between indextree's types this is made more explicit
 #[derive(Debug, Clone)]
-struct BPlusTreeNode<K, V> {
+pub struct BPlusTreeNode<K, V> {
     keys:       Vec<K>,
     // for internal nodes values will be not present and the vec will not allocate any space on heap by default
     // https://doc.rust-lang.org/std/vec/struct.Vec.html#guarantees
@@ -170,10 +170,10 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
         if key_index < leaf_node.keys.len() && *leaf_node.keys.get(key_index).unwrap() == *key {
             leaf_node.keys.remove(key_index);
             value = Some(leaf_node.values.remove(key_index));
+            // balance
+            self.balance(leaf_parent_id, leaf_id, leaf_index, path);
         }
 
-        // balance
-        self.balance(leaf_parent_id, leaf_id, leaf_index, path);
         return value;
     }
 
@@ -225,9 +225,16 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
             let mut root = self.arena.get(child_id).unwrap().clone();
 
             if is_underflow {
-                // check if root has any children. If not then tree has no elements left
-                // set the only child as new root
-                self.root = root.children.pop();
+                // here either root is leaf and hence completely empty OR
+                // it can be internal and have only one child
+                let mut new_root = None;
+                if root.children.len() == 1 {
+                    // update root
+                    new_root = root.children.pop();
+                }
+                // free current root
+                self.arena.remove(child_id);
+                self.root = new_root;
             } else {
                 //
                 // if current root is a leaf node then we need to keep the pivot both in parent and in left child whereas if it's
@@ -305,7 +312,6 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
 
             // distribute
             let mut insert_divider_key_at = divider_key_start;
-            // we need new sibling to account for overflow
             for(_, sibling) in siblings.iter_mut() {
                 // fill
                 for _ in 0..(self.b * 2 - 1) {
@@ -611,5 +617,45 @@ mod tests {
                 assert_eq!(t.get(&i), None);
             }
         }
+    }
+
+    #[test]
+    fn nodes_are_freed_from_arena_after_deletion() {
+        let mut t = BPlusTree::<u32, u32>::new();
+        assert_eq!(t.arena.iter().len(), 0);
+        t.insert(1, 1);
+        t.insert(2, 2);
+        t.insert(3, 3);
+        assert_eq!(t.arena.iter().len(), 1);
+        t.insert(4, 4);
+        t.insert(5, 5);
+        assert_eq!(t.arena.iter().len(), 3);
+        t.insert(6, 6);
+        t.insert(7, 7);
+        t.insert(8, 8);
+        t.insert(9, 9);
+        t.insert(10, 10);
+        t.insert(11, 11);
+        t.insert(12, 12);
+        t.insert(13, 13);
+        assert_eq!(t.arena.iter().len(), 8);
+        t.remove(&10);
+        t.remove(&11);
+        t.remove(&2);
+        t.remove(&3);
+        t.remove(&4);
+        t.remove(&5);
+        t.remove(&7);
+        t.remove(&8);
+        t.remove(&9);
+        assert_eq!(t.arena.iter().len(), 7);
+        t.remove(&12);
+        assert_eq!(t.arena.iter().len(), 4);
+        t.remove(&1);
+        assert_eq!(t.arena.iter().len(), 1);
+        t.remove(&6);
+        assert_eq!(t.arena.iter().len(), 1);
+        t.remove(&13);
+        assert_eq!(t.arena.iter().len(), 0);
     }
 }
