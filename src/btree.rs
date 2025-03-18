@@ -99,6 +99,53 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
         return None;
     }
 
+    // @todo we should be able to query when start or end both are not present
+    pub fn get_in_range(&self, start: &K, end: &K) -> Vec<&V> {
+        let mut values = Vec::<&V>::new();
+        if self.root.is_none() {
+            return values;
+        }
+
+        let mut path = self.search(start);
+        let leaf_id;
+        // when the leaf itself is a root node then path will be empty
+        if path.is_empty() {
+            leaf_id         = self.root.unwrap();
+        } else {
+            let leaf_parent = path.pop().unwrap();
+            leaf_id         = leaf_parent.child_id;
+        }
+
+        let mut leaf_node = self.arena.get(leaf_id).unwrap();
+        let key_index = Self::search_key(leaf_node, start);
+        if key_index < leaf_node.keys.len() && *leaf_node.keys.get(key_index).unwrap() == *start {
+            // first copy values of current leaf node from key_index
+            for (key, value) in leaf_node.keys.iter().skip(key_index).zip(leaf_node.values.iter().skip(key_index)) {
+                if *key <= *end {
+                    values.push(value);
+                } else {
+                    return values;
+                }
+            }
+
+            let mut next_leaf_node_id = leaf_node.right;
+            // add values from current leaf node
+            while let Some(leaf_id) = next_leaf_node_id {
+                leaf_node = self.arena.get(leaf_id).unwrap();
+                for (key, value) in leaf_node.keys.iter().zip(leaf_node.values.iter()) {
+                    if *key <= *end {
+                        values.push(value);
+                    } else {
+                        return values;
+                    }
+                }
+                next_leaf_node_id = leaf_node.right;
+            }
+        }
+
+        return values;
+    }
+
     // insert a key value pair. If the map did not have this key present, None is returned.
     pub fn insert(&mut self, key: K, value: V) -> Option<V>{
         // if root is empty then create the root node
@@ -657,5 +704,15 @@ mod tests {
         assert_eq!(t.arena.iter().len(), 1);
         t.remove(&13);
         assert_eq!(t.arena.iter().len(), 0);
+    }
+
+    #[test]
+    fn test_get_in_range() {
+        let mut t: BPlusTree<u32, u32> = BPlusTree::new();
+        for i in 1..=100 { t.insert(i, i); }
+        let values = t.get_in_range(&1, &100);
+        for i in 1..=100 {
+            assert_eq!(*values.get(i - 1).unwrap(), &(i as u32));
+        }
     }
 }
