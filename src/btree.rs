@@ -1,20 +1,20 @@
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::cmp::Ord;
+use std::cmp::{Ord, Ordering};
 use thunderdome::{Arena, Index as ArenaNodeIndex};
 
 #[derive(Debug)]
 pub struct BPlusTree<K, V> {
-    // we will store nodes in arena
-    arena:  Arena<BPlusTreeNode<K, V>>,
-    root:   Option<ArenaNodeIndex>,
+    arena:                      Arena<BPlusTreeNode<K, V>>,
+    root:                       Option<ArenaNodeIndex>,
     // min_keys = b - 1 && max_keys = 2 * b - 1. b > 1
-    b:      usize,
+    b:                          usize,
+    balance_siblings_per_side:  usize
 }
 
 // to reduce confusion between indextree's types this is made more explicit
 #[derive(Debug, Clone)]
-pub struct BPlusTreeNode<K, V> {
+struct BPlusTreeNode<K, V> {
     keys:       Vec<K>,
     // for internal nodes values will be not present and the vec will not allocate any space on heap by default
     // https://doc.rust-lang.org/std/vec/struct.Vec.html#guarantees
@@ -32,11 +32,38 @@ struct PathDetail {
     child_index:        usize,              // this is the index in `BPlusTreeNode.children` array.
 }
 
-impl<K, V> BPlusTreeNode<K, V> {
+enum SearchResult {
+    Found(usize),
+    GoDown(usize)
+}
+
+#[derive(Debug)]
+struct Sibling<K, V> {
+    id:     ArenaNodeIndex,
+    node:   BPlusTreeNode<K, V>
+}
+
+impl<K: Ord, V> BPlusTreeNode<K, V> {
     pub fn new() -> Self {
         Self {
             keys: Default::default(), values: Default::default(), children: Default::default(), left: None, right: None
         }
+    }
+
+    pub fn search(&self, key: &K) -> SearchResult {
+        // For smaller keys linear search will perform *singnificantly* better
+        self.search_linear(key)
+    }
+
+    fn search_linear(&self, key: &K) -> SearchResult {
+        for (i, k) in self.keys.iter().enumerate() {
+            match k.cmp(key) {
+                Ordering::Equal => return SearchResult::Found(i),
+                Ordering::Greater => return SearchResult::GoDown(i),
+                Ordering::Less => {},
+            }
+        }
+        SearchResult::GoDown(self.keys.len())
     }
 }
 
@@ -45,11 +72,13 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
     pub fn new() -> Self {
         Self {
             arena: Arena::new(),
-            b: 2,
             root: None,
+            b: 2,
+            balance_siblings_per_side: 2
         }
     }
 
+    // search the key until we reach the leaf node and return the search path
     fn search(&self, key: &K) -> Vec<PathDetail> {
         let mut path: Vec<PathDetail> = vec![];
         let mut node_id = self.root.unwrap();
@@ -57,7 +86,11 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
 
         // while we don't reach to leaf node
         while !node.children.is_empty() {
-            let child_index = Self::search_key(node, key);
+            let search_result = node.search(key);
+            let child_index = match search_result {
+                SearchResult::GoDown(child_index) => child_index,
+                SearchResult::Found(child_index) => child_index,
+            };
             let path_detail= PathDetail {parent_id: node_id, child_index, child_id: *node.children.get(child_index).unwrap()};
             node_id = path_detail.child_id;
             node = self.arena.get(node_id).unwrap();
@@ -68,35 +101,24 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
         path
     }
 
-    fn search_key(node: &BPlusTreeNode<K, V>, key: &K) -> usize {
-        // @Speed: For smaller arrays the linear search will perform better than binary search. Our implementation should
-        // use whatever is fast depending upon number of keys
-        node.keys.binary_search(key).unwrap_or_else(|err| err)
-    }
-
-    // get immutable reference to the key
+    // get immutable reference to the value
     pub fn get(&self, key: &K) -> Option<&V> {
         if self.root.is_none() {
             return None;
         }
 
         let mut path = self.search(key);
-        let leaf_id;
-        // when the leaf itself is a root node then path will be empty
-        if path.is_empty() {
-            leaf_id         = self.root.unwrap();
-        } else {
-            let leaf_parent = path.pop().unwrap();
+        let mut leaf_id = self.root.unwrap();
+        if let Some(leaf_parent) = path.pop() {
             leaf_id         = leaf_parent.child_id;
         }
 
         let leaf_node = self.arena.get(leaf_id).unwrap();
-        let key_index = Self::search_key(leaf_node, &key);
-        if key_index < leaf_node.keys.len() && *leaf_node.keys.get(key_index).unwrap() == *key {
-            return leaf_node.values.get(key_index);
-        }
 
-        return None;
+        match leaf_node.search(&key) {
+            SearchResult::Found(key_index) => leaf_node.values.get(key_index),
+            _ => None
+        }
     }
 
     // @todo we should be able to query when start or end both are not present
@@ -107,40 +129,38 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
         }
 
         let mut path = self.search(start);
-        let leaf_id;
-        // when the leaf itself is a root node then path will be empty
-        if path.is_empty() {
-            leaf_id         = self.root.unwrap();
-        } else {
-            let leaf_parent = path.pop().unwrap();
+        let mut leaf_id = self.root.unwrap();
+        if let Some(leaf_parent) = path.pop() {
             leaf_id         = leaf_parent.child_id;
         }
 
         let mut leaf_node = self.arena.get(leaf_id).unwrap();
-        let key_index = Self::search_key(leaf_node, start);
-        if key_index < leaf_node.keys.len() && *leaf_node.keys.get(key_index).unwrap() == *start {
-            // first copy values of current leaf node from key_index
-            for (key, value) in leaf_node.keys.iter().skip(key_index).zip(leaf_node.values.iter().skip(key_index)) {
-                if *key <= *end {
-                    values.push(value);
-                } else {
-                    return values;
-                }
-            }
-
-            let mut next_leaf_node_id = leaf_node.right;
-            // add values from current leaf node
-            while let Some(leaf_id) = next_leaf_node_id {
-                leaf_node = self.arena.get(leaf_id).unwrap();
-                for (key, value) in leaf_node.keys.iter().zip(leaf_node.values.iter()) {
+        match leaf_node.search(start) {
+            SearchResult::Found(key_index) => {
+                // first copy values of current leaf node from key_index
+                for (key, value) in leaf_node.keys.iter().skip(key_index).zip(leaf_node.values.iter().skip(key_index)) {
                     if *key <= *end {
                         values.push(value);
                     } else {
                         return values;
                     }
                 }
-                next_leaf_node_id = leaf_node.right;
-            }
+
+                let mut next_leaf_node_id = leaf_node.right;
+                // add values from current leaf node
+                while let Some(leaf_id) = next_leaf_node_id {
+                    leaf_node = self.arena.get(leaf_id).unwrap();
+                    for (key, value) in leaf_node.keys.iter().zip(leaf_node.values.iter()) {
+                        if *key <= *end {
+                            values.push(value);
+                        } else {
+                            return values;
+                        }
+                    }
+                    next_leaf_node_id = leaf_node.right;
+                }
+            },
+            _ => {}
         }
 
         return values;
@@ -150,20 +170,14 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
     pub fn insert(&mut self, key: K, value: V) -> Option<V>{
         // if root is empty then create the root node
         if self.root.is_none() {
-            self.root = Some(self.insert_node(BPlusTreeNode::new()));
+            self.root = Some(self.arena.insert(BPlusTreeNode::new()));
         }
 
         let mut path = self.search(&key);
-        let leaf_parent_id;
-        let leaf_id;
-        let leaf_index;
-        // when the leaf itself is a root node then path will be empty
-        if path.is_empty() {
-            leaf_parent_id  = None;
-            leaf_index      = None;
-            leaf_id         = self.root.unwrap();
-        } else {
-            let leaf_parent = path.pop().unwrap();
+        let mut leaf_id = self.root.unwrap();
+        let mut leaf_index = None;
+        let mut leaf_parent_id = None;
+        if let Some(leaf_parent) = path.pop() {
             leaf_parent_id  = Some(leaf_parent.parent_id);
             leaf_index      = Some(leaf_parent.child_index);
             leaf_id         = leaf_parent.child_id;
@@ -171,21 +185,21 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
 
         // insert the new key/value inside the leaf node, possibly causing overflow
         let leaf_node = self.arena.get_mut(leaf_id).unwrap();
-        let insert_at = Self::search_key(leaf_node, &key);
-        // if the key is already present then update the value, otherwise insert it
-        if insert_at < leaf_node.keys.len() && *leaf_node.keys.get(insert_at).unwrap() == key {
-            //@note: when we will be having variable sized values we need to call balance
-            let old_val = Some(leaf_node.values.get(insert_at).unwrap().clone());
-            *leaf_node.values.get_mut(insert_at).unwrap() = value;
-            return old_val;
-        } else {
-            leaf_node.keys.insert(insert_at, key);
-            leaf_node.values.insert(insert_at, value);
+        match leaf_node.search(&key) {
+            SearchResult::Found(insert_at) => {
+                //@note: when we will be having variable sized values we need to call balance
+                let old_val = Some(leaf_node.values.get(insert_at).unwrap().clone());
+                *leaf_node.values.get_mut(insert_at).unwrap() = value;
+                old_val
+            },
+            SearchResult::GoDown(insert_at) => {
+                leaf_node.keys.insert(insert_at, key);
+                leaf_node.values.insert(insert_at, value);
+                // balance
+                self.balance(leaf_parent_id, leaf_id, leaf_index, path);
+                None
+            }
         }
-
-        // balance
-        self.balance(leaf_parent_id, leaf_id, leaf_index, path);
-        return None;
     }
 
     // Removes a key from the map, returning the value at the key if the key was previously in the map.
@@ -195,45 +209,33 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
         }
 
         let mut path = self.search(&key);
-        let leaf_parent_id;
-        let leaf_id;
-        let leaf_index;
-        // when the leaf itself is a root node then path will be empty
-        if path.is_empty() {
-            leaf_parent_id  = None;
-            leaf_index      = None;
-            leaf_id         = self.root.unwrap();
-        } else {
-            let leaf_parent = path.pop().unwrap();
+        let mut leaf_id = self.root.unwrap();
+        let mut leaf_index = None;
+        let mut leaf_parent_id = None;
+        if let Some(leaf_parent) = path.pop() {
             leaf_parent_id  = Some(leaf_parent.parent_id);
             leaf_index      = Some(leaf_parent.child_index);
             leaf_id         = leaf_parent.child_id;
         }
 
-        let mut value = None;
-
         let leaf_node = self.arena.get_mut(leaf_id).unwrap();
-        let key_index = Self::search_key(leaf_node, &key);
-        if key_index < leaf_node.keys.len() && *leaf_node.keys.get(key_index).unwrap() == *key {
-            leaf_node.keys.remove(key_index);
-            value = Some(leaf_node.values.remove(key_index));
-            // balance
-            self.balance(leaf_parent_id, leaf_id, leaf_index, path);
+        match leaf_node.search(&key) {
+            SearchResult::Found(key_index) => {
+                leaf_node.keys.remove(key_index);
+                let value = Some(leaf_node.values.remove(key_index));
+                // balance
+                self.balance(leaf_parent_id, leaf_id, leaf_index, path);
+                value
+            },
+            _ => None
         }
-
-        return value;
     }
 
-    // insert the node in arena
-    fn insert_node(&mut self, node: BPlusTreeNode<K, V>) -> ArenaNodeIndex {
-        self.arena.insert(node)
-    }
-
-    fn get_siblings(&mut self, parent: &BPlusTreeNode<K, V>, child_index: usize) -> (Vec<(ArenaNodeIndex, BPlusTreeNode<K, V>)>, usize) {
+    fn get_siblings(&mut self, parent: &BPlusTreeNode<K, V>, child_index: usize) -> (Vec<Sibling<K, V>>, usize) {
         let num_siblings_per_side = if child_index == 0 || child_index == parent.children.len() - 1 {
-            2
+            self.balance_siblings_per_side * 2
         } else {
-            1
+            self.balance_siblings_per_side
         };
 
         // Calculate ranges for left and right siblings
@@ -250,7 +252,7 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
             if first_sibling_index.is_none() { first_sibling_index = Some(index); }
             let id = *parent.children.get(index).unwrap();
             let node = self.arena.get(id).unwrap().clone();
-            siblings.push((id, node));
+            siblings.push(Sibling { id, node });
         }
 
         (siblings, first_sibling_index.unwrap())
@@ -346,8 +348,8 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
             // copy keys and values
             let mut keys_and_values: VecDeque<_> = VecDeque::new();
             for i in 0..siblings.len() {
-                let (_, s) = siblings.get_mut(i).unwrap();
-                for (key, value) in s.keys.drain(..).zip(s.values.drain(..)) {
+                let sibling = siblings.get_mut(i).unwrap();
+                for (key, value) in sibling.node.keys.drain(..).zip(sibling.node.values.drain(..)) {
                     keys_and_values.push_back((key, value));
                 }
 
@@ -359,22 +361,22 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
 
             // distribute
             let mut insert_divider_key_at = divider_key_start;
-            for(_, sibling) in siblings.iter_mut() {
+            for sibling in siblings.iter_mut() {
                 // fill
                 for _ in 0..(self.b * 2 - 1) {
                     if let Some((key, value)) = keys_and_values.pop_front() {
-                        sibling.keys.push(key);
-                        sibling.values.push(value);
+                        sibling.node.keys.push(key);
+                        sibling.node.values.push(value);
                     } else {
                         // filled all key values
                         break;
                     }
                 }
 
-                // we will reach here when we completely fill the current sibling
+                // we will reach here when we completely fill the current sibling node
                 // if there are still keys left then add divider key
                 if !keys_and_values.is_empty() {
-                    parent.keys.insert(insert_divider_key_at, sibling.keys.last().unwrap().clone());
+                    parent.keys.insert(insert_divider_key_at, sibling.node.keys.last().unwrap().clone());
                     insert_divider_key_at += 1;
                 } else {
                     break;
@@ -390,7 +392,7 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
                 }
                 assert!(new_sibling.keys.len() <= 2 * self.b - 1, "new sibling node overflow");
                 // update pointers
-                let (current_rightmost_node_id, current_rightmost_node) = siblings.last_mut().unwrap();
+                let Sibling {id: current_rightmost_node_id, node: current_rightmost_node} = siblings.last_mut().unwrap();
                 // new sibling node sits in the middle of current rightmost and one node after that (called as next below)
                 new_sibling.right = current_rightmost_node.right;
                 new_sibling.left = Some(*current_rightmost_node_id);
@@ -405,18 +407,18 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
                 // new sibling will be right to the last divider key that we've added
                 parent.children.insert(insert_divider_key_at, new_sibling_id);
             } else {
-                if let Some(first_empty_sibling_index) = siblings.iter().position(|s| s.1.keys.is_empty()) {
-                    let next = siblings.last_mut().unwrap().1.right;
+                if let Some(first_empty_sibling_index) = siblings.iter().position(|s| s.node.keys.is_empty()) {
+                    let next = siblings.last_mut().unwrap().node.right;
                     let last_filled_sibling = siblings.get_mut(first_empty_sibling_index - 1).unwrap();
                     // update right for last filled
-                    last_filled_sibling.1.right = next;
+                    last_filled_sibling.node.right = next;
                     // update left for next node after last filled
                     if let Some(next) = next {
                         let next_node = self.arena.get_mut(next).unwrap();
-                        next_node.left = Some(last_filled_sibling.0);
+                        next_node.left = Some(last_filled_sibling.id);
                     }
-                    // remove empty nodes from siblings list, arena and corresponding child_id's form parent
-                    for (id, _) in siblings.drain(first_empty_sibling_index..) {
+                    // remove empty nodes from siblings list, arena and from parent
+                    for Sibling {id, ..} in siblings.drain(first_empty_sibling_index..) {
                         parent.children.remove(parent.children.iter().position(|child_id| *child_id == id).unwrap());
                         self.arena.remove(id);
                     }
@@ -425,15 +427,15 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
 
             // assert pointers
             // @note: this can be made conditional
-            for (sibling_index, (sibling_id, sibling)) in siblings.iter().enumerate() {
+            for (sibling_index, Sibling {id, node}) in siblings.iter().enumerate() {
                 if sibling_index + 1 < siblings.len() {
-                    let (right_id, right) = siblings.get(sibling_index + 1).unwrap();
-                    assert_eq!(sibling.right.unwrap(), *right_id, "Incorrect sibling pointers");
-                    assert_eq!(right.left.unwrap(), *sibling_id, "Incorrect sibling pointers");
+                    let Sibling {node: right, id: right_id} = siblings.get(sibling_index + 1).unwrap();
+                    assert_eq!(node.right.unwrap(), *right_id, "Incorrect sibling pointers");
+                    assert_eq!(right.left.unwrap(), *id, "Incorrect sibling pointers");
                 } else {
-                    if let Some(right_id) = sibling.right {
+                    if let Some(right_id) = node.right {
                         let right = self.arena.get(right_id).unwrap();
-                        assert_eq!(right.left.unwrap(), *sibling_id, "Incorrect sibling pointers");
+                        assert_eq!(right.left.unwrap(), *id, "Incorrect sibling pointers");
                     }
                 }
             }
@@ -442,9 +444,9 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
             let mut keys: VecDeque<_> = VecDeque::new();
             let mut children: VecDeque<_> = VecDeque::new();
             for i in 0..siblings.len() {
-                let (_, s) = siblings.get_mut(i).unwrap();
-                for key in s.keys.drain(..) { keys.push_back(key); }
-                for child in s.children.drain(..) { children.push_back(child); }
+                let sibling = siblings.get_mut(i).unwrap();
+                for key in sibling.node.keys.drain(..) { keys.push_back(key); }
+                for child in sibling.node.children.drain(..) { children.push_back(child); }
                 // copy the divider key if this is not the last sibling
                 if i < siblings.len() - 1 {
                     keys.push_back(parent.keys.remove(divider_key_start));
@@ -457,12 +459,12 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
             let mut remaining_keys = keys.len();
 
             while remaining_keys > 0 && current_sibling < siblings.len() {
-                let (_, s) = siblings.get_mut(current_sibling).unwrap();
+                let sibling = siblings.get_mut(current_sibling).unwrap();
                 // if exactly two keys are remaining and this node does not have enough space
                 // one key will get added inside parent and other inside the next sibling
-                if remaining_keys == 2 && s.keys.len() + 2 > self.b * 2 - 1 {
+                if remaining_keys == 2 && sibling.node.keys.len() + 2 > self.b * 2 - 1 {
                     // attach right child
-                    s.children.push(children.pop_front().unwrap());
+                    sibling.node.children.push(children.pop_front().unwrap());
                     // insert divider key
                     parent.keys.insert(insert_divider_key_at, keys.pop_front().unwrap());
                     remaining_keys -= 1;
@@ -471,14 +473,14 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
                     current_sibling += 1;
                 } else {
                     // add key and left child
-                    s.keys.push(keys.pop_front().unwrap());
+                    sibling.node.keys.push(keys.pop_front().unwrap());
                     remaining_keys -= 1;
-                    s.children.push(children.pop_front().unwrap());
+                    sibling.node.children.push(children.pop_front().unwrap());
 
                     // if this sibling gets full
-                    if s.keys.len() == self.b * 2 - 1 {
+                    if sibling.node.keys.len() == self.b * 2 - 1 {
                         // attach right child
-                        s.children.push(children.pop_front().unwrap());
+                        sibling.node.children.push(children.pop_front().unwrap());
                         // remaining keys and children will be pushed inside new sibling
                         current_sibling += 1;
                         // if we have some remaining keys then divider needs to get added
@@ -492,7 +494,7 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
                     // else if sibling does not get full but all keys are distributed
                     else if remaining_keys == 0 {
                         // attach right child
-                        s.children.push(children.pop_front().unwrap());
+                        sibling.node.children.push(children.pop_front().unwrap());
                         break;
                     }
                 }
@@ -512,9 +514,9 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
                 parent.children.insert(insert_divider_key_at, new_sibling_id);
             }
             // if we have some empty siblings
-            else if let Some(first_empty_sibling_index) = siblings.iter().position(|s| s.1.keys.is_empty()) {
+            else if let Some(first_empty_sibling_index) = siblings.iter().position(|s| s.node.keys.is_empty()) {
                  // remove empty nodes from siblings list, arena and corresponding child_id's form parent
-                 for (id, _) in siblings.drain(first_empty_sibling_index..) {
+                 for Sibling {id, ..} in siblings.drain(first_empty_sibling_index..) {
                     parent.children.remove(parent.children.iter().position(|child_id| *child_id == id).unwrap());
                     self.arena.remove(id);
                 }
@@ -522,17 +524,15 @@ where K: Ord + Debug + Clone, V: Debug + Clone {
         }
 
         //
-        // persist
+        // persist updated siblings and parent
         //
-        for (sibling_id, sibling) in siblings {
-            self.arena.insert_at(sibling_id, sibling);
+        for Sibling {id, node} in siblings {
+            self.arena.insert_at(id, node);
         }
         self.arena.insert_at(parent_id, parent);
 
         if let Some(path_detail) = path.pop() {
-            //@note: we can later remove `PathDetail.child_id` as it is same as parent_id,
-            // infact we are using the parent_id in below example instead of one from `PathDetail`
-            self.balance(Some(path_detail.parent_id), parent_id, Some(path_detail.child_index), path);
+            self.balance(Some(path_detail.parent_id), path_detail.child_id, Some(path_detail.child_index), path);
         } else {
             self.balance(None, parent_id, None, path);
         }
