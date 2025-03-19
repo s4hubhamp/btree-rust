@@ -1,4 +1,3 @@
-mod btree;
-use btree::BPlusTree;
+use btree_rust::btree::BPlusTree;
 
 fn main() {}

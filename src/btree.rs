@@ -52,7 +52,8 @@ impl<K: Ord, V> BPlusTreeNode<K, V> {
 
     pub fn search(&self, key: &K) -> SearchResult {
         // For smaller keys linear search will perform *singnificantly* better
-        self.search_linear(key)
+        // self.search_linear(key)
+        self.search_binary(key)
     }
 
     fn search_linear(&self, key: &K) -> SearchResult {
@@ -65,15 +66,37 @@ impl<K: Ord, V> BPlusTreeNode<K, V> {
         }
         SearchResult::GoDown(self.keys.len())
     }
+
+    fn search_binary(&self, key: &K) -> SearchResult {
+        let mut low: i32 = 0;
+        let mut high: i32 = (self.keys.len() as i32) - 1;
+        let mut mid: i32 = 0;
+
+        while low <= high {
+            mid = (low + high) / 2;
+
+            match (self.keys[mid as usize]).cmp(key) {
+                Ordering::Equal => return SearchResult::Found(mid as usize),
+                Ordering::Greater => {
+                    high = mid - 1;
+                },
+                Ordering::Less => {
+                    low = mid + 1;
+                },
+            }
+        }
+
+        return SearchResult::GoDown(low as usize);
+    }
 }
 
 impl<K, V> BPlusTree<K, V>
 where K: Ord + Debug + Clone, V: Debug + Clone {
-    pub fn new() -> Self {
+    pub fn new(b: usize) -> Self {
         Self {
             arena: Arena::new(),
             root: None,
-            b: 2,
+            b,
             balance_siblings_per_side: 2
         }
     }
@@ -593,7 +616,7 @@ mod tests {
 
     #[test]
     fn incremental_inserts_and_deletes() {
-        let mut t: BPlusTree<u32, u32> = BPlusTree::new();
+        let mut t: BPlusTree<u32, u32> = BPlusTree::new(5);
         for i in 1..=1000 {
             assert_eq!(t.insert(i, i), None);
             assert_eq!(t.get(&i), Some(&i));
@@ -604,7 +627,7 @@ mod tests {
 
     #[test]
     fn decremental_inserts_and_deletes() {
-        let mut t: BPlusTree<u32, u32> = BPlusTree::new();
+        let mut t: BPlusTree<u32, u32> = BPlusTree::new(3);
         for i in (1..=1000).rev() {
             assert_eq!(t.insert(i, i), None);
             assert_eq!(t.get(&i), Some(&i));
@@ -615,7 +638,7 @@ mod tests {
 
     #[test]
     fn incremental_inserts_and_random_deletes() {
-        let mut t: BPlusTree<u32, u32> = BPlusTree::new();
+        let mut t: BPlusTree<u32, u32> = BPlusTree::new(6);
         let mut array: [u32; 1000] = [0; 1000];
         for (i, elem) in array.iter_mut().enumerate() {
             *elem = (i + 1) as u32;
@@ -633,7 +656,7 @@ mod tests {
 
     #[test]
     fn incremental_inserts_and_decremental_deletes() {
-        let mut t: BPlusTree<u32, u32> = BPlusTree::new();
+        let mut t: BPlusTree<u32, u32> = BPlusTree::new(4);
         for i in 1..=1000 {
             assert_eq!(t.insert(i, i), None);
         }
@@ -647,7 +670,7 @@ mod tests {
     #[test]
     fn random_inserts_and_deletes() {
         for _ in 0..10 {
-            let mut t: BPlusTree<u32, u32> = BPlusTree::new();
+            let mut t: BPlusTree<u32, u32> = BPlusTree::new(3);
             let mut array: [u32; 1000] = [0; 1000];
             for (i, elem) in array.iter_mut().enumerate() {
                 *elem = (i + 1) as u32;
@@ -668,7 +691,7 @@ mod tests {
 
     #[test]
     fn nodes_are_freed_from_arena_after_deletion() {
-        let mut t = BPlusTree::<u32, u32>::new();
+        let mut t = BPlusTree::<u32, u32>::new(2);
         assert_eq!(t.arena.iter().len(), 0);
         t.insert(1, 1);
         t.insert(2, 2);
@@ -708,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_get_in_range() {
-        let mut t: BPlusTree<u32, u32> = BPlusTree::new();
+        let mut t: BPlusTree<u32, u32> = BPlusTree::new(5);
         for i in 1..=100 { t.insert(i, i); }
         let values = t.get_in_range(&1, &100);
         for i in 1..=100 {
